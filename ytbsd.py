@@ -535,7 +535,10 @@ class VideoWorkQueue:
                     results.append({
                         'id': vid,
                         'title': video['title'],
+                        'channel': video.get('channel', ''),
+                        'upload_date': video.get('upload_date', ''),
                         'transcript': None,
+                        'timestamped_transcript': None,
                         'language': None,
                         'method': 'failed',
                         'error_detail': f"Failed after {self.proxy_refresh_count} proxy refresh cycles"
@@ -610,7 +613,7 @@ def get_video_ids_from_url(url: str, mode: str, proxy_pool: ProxyPool = None) ->
         status_text.plain = "Fetching video info... Attempting direct connection..."
         
         ydl_opts = {
-            'extract_flat': True,
+            'extract_flat': 'in_playlist',
             'quiet': True,
             'no_warnings': True,
         }
@@ -620,9 +623,12 @@ def get_video_ids_from_url(url: str, mode: str, proxy_pool: ProxyPool = None) ->
             info = extract_video_info_with_timeout(url, ydl_opts, timeout=VIDEO_INFO_TIMEOUT)
 
             if mode == "single":
-                videos = [{'id': info.get('id'), 'title': info.get('title', 'Unknown')}]
+                videos = [{'id': info.get('id'), 'title': info.get('title', 'Unknown'),
+                           'channel': info.get('uploader', info.get('channel', '')),
+                           'upload_date': info.get('upload_date', '')}]
                 source_name = sanitize_filename(info.get('title', 'video'))
             else:
+                channel_name = info.get('uploader', info.get('channel', ''))
                 source_name = sanitize_filename(info.get('title', info.get('uploader', 'unknown')))
                 entries = info.get('entries', [])
 
@@ -630,7 +636,9 @@ def get_video_ids_from_url(url: str, mode: str, proxy_pool: ProxyPool = None) ->
                     if entry:
                         videos.append({
                             'id': entry.get('id'),
-                            'title': entry.get('title', 'Unknown')
+                            'title': entry.get('title', 'Unknown'),
+                            'channel': entry.get('uploader', entry.get('channel', channel_name)),
+                            'upload_date': entry.get('upload_date', '')
                         })
 
             # Success with direct connection
@@ -664,7 +672,7 @@ def get_video_ids_from_url(url: str, mode: str, proxy_pool: ProxyPool = None) ->
             status_text.plain = f"Fetching video info... Attempt {proxy_attempts_made + 1}: Trying proxy {proxy_ip}..."
             
             ydl_opts = {
-                'extract_flat': True,
+                'extract_flat': 'in_playlist',
                 'quiet': True,
                 'no_warnings': True,
                 'proxy': f"http://{current_proxy}",
@@ -675,9 +683,12 @@ def get_video_ids_from_url(url: str, mode: str, proxy_pool: ProxyPool = None) ->
                 info = extract_video_info_with_timeout(url, ydl_opts, timeout=VIDEO_INFO_TIMEOUT)
 
                 if mode == "single":
-                    videos = [{'id': info.get('id'), 'title': info.get('title', 'Unknown')}]
+                    videos = [{'id': info.get('id'), 'title': info.get('title', 'Unknown'),
+                               'channel': info.get('uploader', info.get('channel', '')),
+                               'upload_date': info.get('upload_date', '')}]
                     source_name = sanitize_filename(info.get('title', 'video'))
                 else:
+                    channel_name = info.get('uploader', info.get('channel', ''))
                     source_name = sanitize_filename(info.get('title', info.get('uploader', 'unknown')))
                     entries = info.get('entries', [])
 
@@ -685,7 +696,9 @@ def get_video_ids_from_url(url: str, mode: str, proxy_pool: ProxyPool = None) ->
                         if entry:
                             videos.append({
                                 'id': entry.get('id'),
-                                'title': entry.get('title', 'Unknown')
+                                'title': entry.get('title', 'Unknown'),
+                                'channel': entry.get('uploader', entry.get('channel', channel_name)),
+                                'upload_date': entry.get('upload_date', '')
                             })
 
                 # Success with proxy
@@ -810,53 +823,43 @@ def clear_progress():
 # Markdown Output
 # ============================================================================
 
+def _format_upload_date(upload_date: str) -> str:
+    """Format yt-dlp upload_date (YYYYMMDD) to readable format (e.g., 'Apr 3, 2024')."""
+    if not upload_date or len(upload_date) != 8:
+        return ''
+    try:
+        dt = datetime.strptime(upload_date, '%Y%m%d')
+        return dt.strftime('%b %-d, %Y') if sys.platform != 'win32' else dt.strftime('%b %d, %Y').replace(' 0', ' ')
+    except ValueError:
+        return upload_date
+
+
 def create_markdown_output(videos_data: list[dict], source_name: str, source_type: str) -> str:
-    """Create markdown formatted output optimized for LLM RAG."""
-    lines = []
+    """Create markdown formatted output with timestamped transcripts."""
+    sections = []
 
-    lines.append(f"# {source_name}")
-    lines.append("")
-    lines.append(f"**Source Type:** {source_type.title()}")
-    lines.append(f"**Total Videos:** {len(videos_data)}")
-    videos_with_transcript = sum(1 for v in videos_data if v.get('transcript'))
-    lines.append(f"**Videos with Transcripts:** {videos_with_transcript}")
-    lines.append(f"**Downloaded:** {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    lines.append("")
-    lines.append("---")
-    lines.append("")
+    for video in videos_data:
+        if not video.get('transcript'):
+            continue
 
-    lines.append("## Table of Contents")
-    lines.append("")
-    for i, video in enumerate(videos_data, 1):
-        if video.get('transcript'):
-            anchor = re.sub(r'[^a-z0-9\s-]', '', video['title'].lower())
-            anchor = re.sub(r'\s+', '-', anchor)
-            lines.append(f"{i}. [{video['title']}](#{anchor})")
-    lines.append("")
-    lines.append("---")
-    lines.append("")
+        header_lines = []
+        header_lines.append(f"# Video Title: {video['title']}")
+        header_lines.append(f"# Video ID: {video['id']}")
+        if video.get('channel'):
+            header_lines.append(f"# Channel: {video['channel']}")
+        if video.get('upload_date'):
+            formatted_date = _format_upload_date(video['upload_date'])
+            if formatted_date:
+                header_lines.append(f"# Published: {formatted_date}")
 
-    for i, video in enumerate(videos_data, 1):
-        lines.append(f"## {i}. {video['title']}")
-        lines.append("")
-        lines.append(f"**Video ID:** {video['id']}")
-        lines.append(f"**URL:** https://www.youtube.com/watch?v={video['id']}")
-        if video.get('language'):
-            lines.append(f"**Transcript Language:** {video['language']}")
-        lines.append("")
+        header = '\n'.join(header_lines)
 
-        if video.get('transcript'):
-            lines.append("### Transcript")
-            lines.append("")
-            lines.append(video['transcript'])
-        else:
-            lines.append("*No transcript available for this video.*")
+        # Use timestamped transcript if available, otherwise fall back to plain text
+        transcript = video.get('timestamped_transcript', video.get('transcript', ''))
 
-        lines.append("")
-        lines.append("---")
-        lines.append("")
+        sections.append(f"{header}\n\n{transcript}")
 
-    return '\n'.join(lines)
+    return '\n\n---\n\n'.join(sections) + '\n'
 
 
 def count_words(text: str) -> int:
@@ -1060,7 +1063,15 @@ def fetch_content_with_timeout(transcript_obj, timeout: int = VIDEO_FETCH_TIMEOU
     def _fetch():
         fetched = transcript_obj.fetch()
         text = ' '.join(snippet.text for snippet in fetched)
-        return text, fetched
+        # Build timestamped text for markdown output: [M:SS] text
+        timestamped_lines = []
+        for snippet in fetched:
+            start = int(snippet.start)
+            minutes = start // 60
+            seconds = start % 60
+            timestamped_lines.append(f"[{minutes}:{seconds:02d}] {snippet.text}")
+        timestamped_text = '\n'.join(timestamped_lines)
+        return text, fetched, timestamped_text
 
     executor = ThreadPoolExecutor(max_workers=1)
     try:
@@ -1113,7 +1124,10 @@ def download_single_video_with_proxy(video: dict, proxy: str, status_callback=No
     result_data = {
         'id': video_id,
         'title': video_title,
+        'channel': video.get('channel', ''),
+        'upload_date': video.get('upload_date', ''),
         'transcript': None,
+        'timestamped_transcript': None,
         'language': None,
         'method': None,
         'error_detail': None
@@ -1146,12 +1160,13 @@ def download_single_video_with_proxy(video: dict, proxy: str, status_callback=No
         try:
             if status_callback:
                 status_callback("Downloading content...")
-            text, fetched_transcript = fetch_content_with_timeout(transcript_obj, timeout=VIDEO_FETCH_TIMEOUT)
+            text, fetched_transcript, timestamped_text = fetch_content_with_timeout(transcript_obj, timeout=VIDEO_FETCH_TIMEOUT)
             if status_callback:
                 status_callback(f"✓ OK ({len(text)} chars) via {proxy_ip}")
 
             # Success!
             result_data['transcript'] = text
+            result_data['timestamped_transcript'] = timestamped_text
             result_data['fetched_transcript'] = fetched_transcript  # Raw data for SRT
             result_data['language'] = lang_info
             result_data['method'] = strategy_name.lower()
@@ -1186,7 +1201,10 @@ def download_single_video(video: dict, proxy_pool: ProxyPool, status_callback=No
     result_data = {
         'id': video_id,
         'title': video_title,
+        'channel': video.get('channel', ''),
+        'upload_date': video.get('upload_date', ''),
         'transcript': None,
+        'timestamped_transcript': None,
         'language': None,
         'method': None,
         'error_detail': None
@@ -1245,12 +1263,13 @@ def download_single_video(video: dict, proxy_pool: ProxyPool, status_callback=No
                 # Fetch content with timeout protection
                 if status_callback:
                     status_callback("Downloading transcript content...")
-                text, fetched_transcript = fetch_content_with_timeout(transcript_obj, timeout=VIDEO_FETCH_TIMEOUT)
+                text, fetched_transcript, timestamped_text = fetch_content_with_timeout(transcript_obj, timeout=VIDEO_FETCH_TIMEOUT)
                 if status_callback:
                     status_callback(f"✓ Downloaded ({len(text)} chars) via {proxy_ip}")
 
                 # Success!
                 result_data['transcript'] = text
+                result_data['timestamped_transcript'] = timestamped_text
                 result_data['fetched_transcript'] = fetched_transcript  # Raw data for SRT
                 result_data['language'] = lang_info
                 result_data['method'] = strategy_name.lower()
