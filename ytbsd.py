@@ -82,6 +82,10 @@ else:
 PROGRESS_DIR = os.path.join(SCRIPT_DIR, "subtitles")
 PROGRESS_FILE = os.path.join(SCRIPT_DIR, ".progress.json")
 PROXY_FILE = os.path.join(SCRIPT_DIR, "proxies.txt")
+MANIFEST_FILE = os.path.join(SCRIPT_DIR, ".manifest.json")
+NO_TRANSCRIPT_LOG = os.path.join(SCRIPT_DIR, "no_transcript_log.txt")
+_no_transcript_log_lock = threading.Lock()
+_no_transcript_logged_ids = set()
 
 
 # ============================================================================
@@ -152,13 +156,16 @@ MAX_PROXY_RETRIES = 20  # Reduced to avoid long waits
 PROXY_TIMEOUT = 15  # Timeout for proxy validation
 
 # Video fetch timeout (seconds) - if a video takes longer, skip it
-VIDEO_FETCH_TIMEOUT = 15
+VIDEO_FETCH_TIMEOUT = 60
+
+# Video fetch timeout for direct connection (no proxy overhead, can be more generous)
+VIDEO_FETCH_TIMEOUT_DIRECT = 120
 
 # Video info extraction timeout (seconds) - timeout for fetching playlist/channel info via proxy
 VIDEO_INFO_TIMEOUT = 15
 
 # Availability check timeout (seconds) - timeout for checking if transcript is available via proxy
-AVAILABILITY_CHECK_TIMEOUT = 15
+AVAILABILITY_CHECK_TIMEOUT = 30
 
 
 # ============================================================================
@@ -291,6 +298,8 @@ class VideoWorkQueue:
 
     MAX_PROXY_REFRESHES = 3
     NO_TRANSCRIPT_VOTES_REQUIRED = 2
+    MAX_WORKERS_PER_VIDEO = 5  # Prevent all threads piling onto one video
+    MAX_FAILURES_PER_VIDEO = 15  # Give up on a video after this many proxy failures
 
     def __init__(self, videos: list[dict], proxy_pool: ProxyPool, status_callback=None):
         self.videos = {v['id']: v for v in videos}  # Map id -> video dict
@@ -309,6 +318,9 @@ class VideoWorkQueue:
 
         # Track "no transcript" votes (need 2 confirmations)
         self.no_transcript_votes = {v['id']: 0 for v in videos}
+
+        # Track consecutive failures per video (timeouts/errors, not proxy issues)
+        self.video_failure_count = {v['id']: 0 for v in videos}
 
         # Track active workers per video
         self.active_workers = {v['id']: 0 for v in videos}
@@ -359,9 +371,12 @@ class VideoWorkQueue:
 
             # Strategy 2: Join an in_progress video with a different proxy
             # Prefer videos with fewer active workers AND fewer attempted proxies
+            # Cap workers per video to avoid flooding YouTube with requests for one video
             in_progress = []
             for vid, state in self.video_states.items():
                 if state == 'in_progress':
+                    if self.active_workers[vid] >= self.MAX_WORKERS_PER_VIDEO:
+                        continue  # Too many threads already on this video
                     available_count = len(all_proxies - self.video_proxy_attempts[vid])
                     if available_count > 0:
                         in_progress.append((vid, self.active_workers[vid], available_count))
@@ -378,44 +393,71 @@ class VideoWorkQueue:
                     self.total_proxy_attempts += 1
                     return (self.videos[vid], proxy)
 
+            # Check if videos are at max workers — threads should wait, not trigger refresh
+            capped_with_proxies = False  # Capped but still have untried proxies
+            capped_no_proxies = False    # Capped and all proxies tried (workers finishing up)
+            for vid in self.video_states:
+                if (self.video_states[vid] == 'in_progress'
+                        and self.active_workers[vid] >= self.MAX_WORKERS_PER_VIDEO):
+                    if len(all_proxies - self.video_proxy_attempts[vid]) > 0:
+                        capped_with_proxies = True
+                    else:
+                        capped_no_proxies = True
+
+            if capped_with_proxies or capped_no_proxies:
+                # Other threads are working, wait for a slot to open
+                self.lock.release()
+                time.sleep(1.0)
+                self.lock.acquire()
+                # If workers are still active, retry to pick up freed slots
+                any_still_active = any(
+                    self.active_workers[vid] > 0
+                    for vid in self.video_states
+                    if self.video_states[vid] == 'in_progress'
+                )
+                if any_still_active:
+                    should_retry = True
+                # else: fall through to Strategy 3 (refresh or fail)
+
             # Strategy 3: Check if we need to refresh proxies
             # All in-progress videos have exhausted all proxies
-            pending_or_in_progress = [vid for vid, state in self.video_states.items()
-                                       if state in ('pending', 'in_progress')]
+            if not should_retry:
+                pending_or_in_progress = [vid for vid, state in self.video_states.items()
+                                           if state in ('pending', 'in_progress')]
 
-            if not pending_or_in_progress:
-                # All videos completed/failed/no_transcript
-                return None
+                if not pending_or_in_progress:
+                    # All videos completed/failed/no_transcript
+                    return None
 
-            # Check if ANY video still has untried proxies
-            any_available = False
-            for vid in pending_or_in_progress:
-                if len(all_proxies - self.video_proxy_attempts[vid]) > 0:
-                    any_available = True
-                    break
+                # Check if ANY video still has untried proxies
+                any_available = False
+                for vid in pending_or_in_progress:
+                    if len(all_proxies - self.video_proxy_attempts[vid]) > 0:
+                        any_available = True
+                        break
 
-            if any_available:
-                # Shouldn't reach here, but retry just in case
-                should_retry = True
-            elif self.refresh_in_progress:
-                # Another thread is refreshing, wait and retry
-                self.lock.release()
-                time.sleep(0.5)
-                self.lock.acquire()
-                should_retry = True
-            else:
-                # All proxies exhausted for all remaining videos - try to refresh
-                if self._refresh_proxies_internal():
-                    # Proxies refreshed successfully
+                if any_available:
+                    # Shouldn't reach here, but retry just in case
+                    should_retry = True
+                elif self.refresh_in_progress:
+                    # Another thread is refreshing, wait and retry
+                    self.lock.release()
+                    time.sleep(0.5)
+                    self.lock.acquire()
                     should_retry = True
                 else:
-                    # Max refreshes reached - mark remaining as failed
-                    for vid in pending_or_in_progress:
-                        if self.video_states[vid] not in ('completed', 'no_transcript'):
-                            self.video_states[vid] = 'failed'
-                            self.failed_count += 1
-                            self.completed_count += 1
-                    return None
+                    # All proxies exhausted for all remaining videos - try to refresh
+                    if self._refresh_proxies_internal():
+                        # Proxies refreshed successfully
+                        should_retry = True
+                    else:
+                        # Max refreshes reached - mark remaining as failed
+                        for vid in pending_or_in_progress:
+                            if self.video_states[vid] not in ('completed', 'no_transcript'):
+                                self.video_states[vid] = 'failed'
+                                self.failed_count += 1
+                                self.completed_count += 1
+                        return None
 
         # Retry after refresh (outside lock)
         if should_retry:
@@ -493,13 +535,31 @@ class VideoWorkQueue:
 
     def mark_proxy_failed(self, video_id: str, proxy: str):
         """
-        Note: We intentionally do NOT globally blacklist proxies.
-        A proxy that fails on video A might work on video B.
-        The per-video tracking in video_proxy_attempts is sufficient.
-        This method exists for interface compatibility.
+        Track per-video failure count. If a video fails too many times across
+        different proxies, it's likely unfetchable (content warning, too short, etc.)
+        and we should give up on it rather than spinning forever.
         """
-        # Don't globally blacklist - proxy might work for other videos
-        pass
+        with self.lock:
+            if self.video_states[video_id] in ('completed', 'no_transcript', 'failed'):
+                return
+
+            self.video_failure_count[video_id] += 1
+
+            if self.video_failure_count[video_id] >= self.MAX_FAILURES_PER_VIDEO:
+                self.video_states[video_id] = 'failed'
+                self.results[video_id] = {
+                    'id': video_id,
+                    'title': self.videos[video_id]['title'],
+                    'channel': self.videos[video_id].get('channel', ''),
+                    'upload_date': self.videos[video_id].get('upload_date', ''),
+                    'transcript': None,
+                    'timestamped_transcript': None,
+                    'language': None,
+                    'method': 'failed',
+                    'error_detail': f"Gave up after {self.MAX_FAILURES_PER_VIDEO} failed attempts across proxies"
+                }
+                self.completed_count += 1
+                self.failed_count += 1
 
     def is_video_done(self, video_id: str) -> bool:
         """Check if video was completed/no_transcript/failed by another thread."""
@@ -820,6 +880,74 @@ def clear_progress():
 
 
 # ============================================================================
+# Download Manifest (Persistent across runs)
+# ============================================================================
+
+def load_manifest() -> dict:
+    """Load the download manifest that tracks what has been downloaded."""
+    if os.path.exists(MANIFEST_FILE):
+        try:
+            with open(MANIFEST_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return {}
+    return {}
+
+
+def save_manifest(manifest: dict):
+    """Save the download manifest."""
+    with open(MANIFEST_FILE, 'w', encoding='utf-8') as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+
+def update_manifest(url: str, source_name: str, source_type: str,
+                    content_type: str, videos_data: list[dict]):
+    """
+    Update the manifest with results from a download run.
+    Merges new downloaded/no_transcript IDs with any existing ones for this URL.
+    """
+    manifest = load_manifest()
+
+    # Normalize key: base channel URL for channels, raw URL for playlists
+    if source_type == "channel":
+        key = normalize_channel_url(url)
+    else:
+        key = url
+
+    existing = manifest.get(key, {})
+    existing_downloaded = set(existing.get('downloaded_ids', []))
+    existing_no_transcript = set(existing.get('no_transcript_ids', []))
+
+    for v in videos_data:
+        if v.get('transcript'):
+            existing_downloaded.add(v['id'])
+        elif v.get('method') == 'no_transcript':
+            existing_no_transcript.add(v['id'])
+
+    manifest[key] = {
+        'source_name': source_name,
+        'source_type': source_type,
+        'content_type': content_type,
+        'downloaded_ids': list(existing_downloaded),
+        'no_transcript_ids': list(existing_no_transcript),
+        'last_updated': datetime.now().isoformat()
+    }
+
+    save_manifest(manifest)
+
+
+def get_manifest_entry(url: str, source_type: str = None) -> dict | None:
+    """Look up a URL in the manifest. Returns the entry or None."""
+    manifest = load_manifest()
+    if source_type == "channel":
+        key = normalize_channel_url(url)
+    else:
+        key = url
+
+    return manifest.get(key)
+
+
+# ============================================================================
 # Markdown Output
 # ============================================================================
 
@@ -1111,7 +1239,8 @@ def check_availability_with_timeout(video_id: str, proxy: str = None, timeout: i
 
 
 
-def download_single_video_with_proxy(video: dict, proxy: str, status_callback=None) -> dict:
+def download_single_video_with_proxy(video: dict, proxy: str, status_callback=None,
+                                     fetch_timeout: int = None) -> dict:
     """
     Try to download a video transcript using ONE specific proxy.
     Returns result dict with success/failure info.
@@ -1135,6 +1264,9 @@ def download_single_video_with_proxy(video: dict, proxy: str, status_callback=No
 
     proxy_ip = proxy.split(':')[0] if proxy else "Direct"
     strategy_name = f"Proxy:{proxy_ip}" if proxy else "Direct"
+    # Use provided timeout, or default based on whether using proxy
+    if fetch_timeout is None:
+        fetch_timeout = VIDEO_FETCH_TIMEOUT if proxy else VIDEO_FETCH_TIMEOUT_DIRECT
 
     if status_callback:
         status_callback(f"Checking via {proxy_ip}...")
@@ -1160,7 +1292,7 @@ def download_single_video_with_proxy(video: dict, proxy: str, status_callback=No
         try:
             if status_callback:
                 status_callback("Downloading content...")
-            text, fetched_transcript, timestamped_text = fetch_content_with_timeout(transcript_obj, timeout=VIDEO_FETCH_TIMEOUT)
+            text, fetched_transcript, timestamped_text = fetch_content_with_timeout(transcript_obj, timeout=fetch_timeout)
             if status_callback:
                 status_callback(f"✓ OK ({len(text)} chars) via {proxy_ip}")
 
@@ -1306,7 +1438,8 @@ def download_single_video(video: dict, proxy_pool: ProxyPool, status_callback=No
 def download_transcripts_parallel(videos: list[dict], source_name: str, source_type: str,
                                    num_threads: int = DEFAULT_THREADS,
                                    start_index: int = 0, existing_data: list[dict] = None,
-                                   completed_ids: set = None, output_config: dict = None):
+                                   completed_ids: set = None, output_config: dict = None,
+                                   content_type: str = None, source_url: str = None):
     """
     Download transcripts in parallel using collaborative multi-proxy pattern.
 
@@ -1408,6 +1541,15 @@ def download_transcripts_parallel(videos: list[dict], source_name: str, source_t
                 method_short = result.get('method', 'unknown').split(':')[-1]
                 status_manager.update_status(thread_slot, f"✓ OK ({result['language']}) via {method_short}")
             elif result['method'] == 'no_transcript':
+                # Log immediately on first detection (deduped per video_id)
+                with _no_transcript_log_lock:
+                    if video_id not in _no_transcript_logged_ids:
+                        _no_transcript_logged_ids.add(video_id)
+                        try:
+                            with open(NO_TRANSCRIPT_LOG, 'a', encoding='utf-8') as f:
+                                f.write(f"{datetime.now().isoformat()}\t{video['title']}\thttps://youtube.com/watch?v={video_id}\n")
+                        except Exception:
+                            pass
                 # Vote for no transcript (needs 2 confirmations)
                 work_queue.mark_no_transcript(video_id, result)
                 if work_queue.is_video_done(video_id):
@@ -1470,19 +1612,93 @@ def download_transcripts_parallel(videos: list[dict], source_name: str, source_t
     for result in new_results:
         completed_ids.add(result['id'])
 
-    # Calculate final counts
-    final_success = sum(1 for v in videos_data if v.get('transcript'))
-    final_no_transcript = sum(1 for v in videos_data if v.get('method') == 'no_transcript')
-    final_failed = len(videos_data) - final_success - final_no_transcript
+    # Calculate counts after proxy phase
+    proxy_success = sum(1 for v in videos_data if v.get('transcript'))
+    proxy_no_transcript = sum(1 for v in videos_data if v.get('method') == 'no_transcript')
+    proxy_failed = len(videos_data) - proxy_success - proxy_no_transcript
 
     # Print errors
     for error_msg in errors:
         print(error_msg)
 
+    print("\n" + "-" * 60)
+    print(f"Proxy phase: {proxy_success} success, {proxy_no_transcript} no transcript, {proxy_failed} failed")
+
+    # ---- Direct-connection fallback for failed videos ----
+    if not was_interrupted and proxy_failed > 0:
+        failed_videos = [v for v in videos_data
+                         if not v.get('transcript') and v.get('method') not in ('no_transcript',)]
+        # Only retry actual failures (not no_transcript)
+        failed_videos = [v for v in failed_videos if v.get('method') in ('error', 'failed')]
+
+        if failed_videos:
+            print(f"\n*** Direct-connection fallback for {len(failed_videos)} failed video(s) ***")
+            print("Throttled requests with backoff to avoid rate limiting...")
+            print("Press Ctrl+C to skip this phase.\n")
+
+            base_delay = 8  # seconds between requests
+            delay = base_delay
+            max_delay = 300  # 5 min max backoff
+            consecutive_failures = 0
+
+            try:
+                for i, failed_video in enumerate(failed_videos):
+                    video_id = failed_video['id']
+                    title_short = failed_video['title'][:50]
+                    print(f"  [{i+1}/{len(failed_videos)}] {title_short}...", end=" ", flush=True)
+
+                    result = download_single_video_with_proxy(failed_video, proxy=None)
+
+                    if result.get('transcript'):
+                        # Success - replace the failed entry in videos_data
+                        for j, v in enumerate(videos_data):
+                            if v['id'] == video_id:
+                                videos_data[j] = result
+                                break
+                        consecutive_failures = 0
+                        delay = base_delay
+                        print(f"OK ({result.get('language', '?')})")
+                    elif result.get('method') == 'no_transcript':
+                        for j, v in enumerate(videos_data):
+                            if v['id'] == video_id:
+                                videos_data[j] = result
+                                break
+                        consecutive_failures = 0
+                        print("No transcript")
+                    else:
+                        # Save the direct-attempt error back so it shows in the final report
+                        for j, v in enumerate(videos_data):
+                            if v['id'] == video_id:
+                                videos_data[j]['error_detail'] = f"Direct: {result.get('error_detail', 'unknown')}"
+                                break
+                        consecutive_failures += 1
+                        error_short = (result.get('error_detail') or 'unknown')[:60]
+                        print(f"FAILED ({error_short})")
+
+                        if consecutive_failures >= 3:
+                            delay = min(delay * 2, max_delay)
+                            print(f"  ** {consecutive_failures} consecutive failures - "
+                                  f"backing off {delay}s (rate limited?) **")
+
+                    # Throttle between requests
+                    if i < len(failed_videos) - 1:
+                        time.sleep(delay)
+
+            except KeyboardInterrupt:
+                print("\n\n** Direct fallback interrupted **")
+                was_interrupted = True
+
+    # Calculate final counts
+    final_success = sum(1 for v in videos_data if v.get('transcript'))
+    final_no_transcript = sum(1 for v in videos_data if v.get('method') == 'no_transcript')
+    final_failed = len(videos_data) - final_success - final_no_transcript
+
     # Final progress save
     progress_data = {
         'source_name': source_name,
         'source_type': source_type,
+        'content_type': content_type,
+        'source_url': source_url,
         'videos': videos,
         'current_index': len(completed_ids),
         'videos_data': videos_data,
@@ -1496,10 +1712,24 @@ def download_transcripts_parallel(videos: list[dict], source_name: str, source_t
     save_progress(progress_data)
 
     print("\n" + "-" * 60)
-    print(f"Results: {final_success} success, {final_no_transcript} no transcript, {final_failed} failed")
+    print(f"Final: {final_success} success, {final_no_transcript} no transcript, {final_failed} failed")
     print(f"Total proxy attempts: {work_queue.total_proxy_attempts}")
     print(f"Proxy refreshes used: {work_queue.proxy_refresh_count}/{VideoWorkQueue.MAX_PROXY_REFRESHES}")
-    print(f"Proxies in pool: {len(proxy_pool.proxies)}")
+    if proxy_failed > 0:
+        direct_recovered = proxy_failed - final_failed
+        print(f"Direct fallback recovered: {direct_recovered}/{proxy_failed}")
+
+    # Print failed video titles so user can investigate
+    if final_failed > 0:
+        still_failed = [v for v in videos_data
+                        if not v.get('transcript') and v.get('method') not in ('no_transcript',)]
+        if still_failed:
+            print(f"\nFailed videos ({len(still_failed)}):")
+            for v in still_failed:
+                error = (v.get('error_detail') or 'unknown')[:80]
+                print(f"  - {v['title']}")
+                print(f"    https://youtube.com/watch?v={v['id']}")
+                print(f"    Error: {error}")
 
     return videos_data, final_success, was_interrupted
 
@@ -1557,16 +1787,17 @@ def get_user_choice(has_unfinished: bool) -> int:
     print("  [3] All videos from a channel")
     if has_unfinished:
         print("  [4] Resume last unfinished job")
+    print("  [5] Resume/update a channel or playlist (download missing)")
     print("  [0] Exit\n")
 
-    max_choice = 4 if has_unfinished else 3
+    max_choice = 5
 
     while True:
         try:
             choice = int(input(f"Enter your choice (0-{max_choice}): "))
             if 0 <= choice <= max_choice:
                 if choice == 4 and not has_unfinished:
-                    print("Invalid choice.")
+                    print("Invalid choice. No unfinished job found.")
                     continue
                 return choice
             print(f"Invalid choice. Please enter 0-{max_choice}.")
@@ -1816,48 +2047,13 @@ def run_new_job(mode: str) -> bool:
         # Normalize the URL first (remove any existing /videos, /shorts, etc.)
         url = normalize_channel_url(url)
         content_type = get_channel_content_type()
-
-        videos = []
-        source_name = ""
         source_type = "channel"
 
-        if content_type == "videos":
-            print(f"\nFetching videos from channel...")
-            try:
-                videos, source_name, source_type = get_video_ids_from_url(url + "/videos", mode, proxy_pool)
-            except Exception as e:
-                print(f"Error fetching video information: {e}")
-                return True
-
-        elif content_type == "shorts":
-            print(f"\nFetching shorts from channel...")
-            try:
-                videos, source_name, source_type = get_video_ids_from_url(url + "/shorts", mode, proxy_pool)
-            except Exception as e:
-                print(f"Error fetching shorts information: {e}")
-                return True
-
-        else:  # both
-            print(f"\nFetching videos from channel...")
-            try:
-                videos_list, source_name, source_type = get_video_ids_from_url(url + "/videos", mode, proxy_pool)
-                videos.extend(videos_list)
-                print(f"Found {len(videos_list)} video(s)")
-            except Exception as e:
-                print(f"Warning: Could not fetch videos: {e}")
-
-            print(f"\nFetching shorts from channel...")
-            try:
-                shorts_list, _, _ = get_video_ids_from_url(url + "/shorts", mode, proxy_pool)
-                videos.extend(shorts_list)
-                print(f"Found {len(shorts_list)} short(s)")
-            except Exception as e:
-                print(f"Warning: Could not fetch shorts: {e}")
-
-            if not source_name:
-                # Try to extract channel name from URL if we couldn't get it
-                match = re.search(r'@([^/]+)', url)
-                source_name = match.group(1) if match else "channel"
+        try:
+            videos, source_name = fetch_channel_videos(url, content_type, proxy_pool)
+        except Exception as e:
+            print(f"Error fetching video information: {e}")
+            return True
 
         if not videos:
             print("No videos found.")
@@ -1868,6 +2064,7 @@ def run_new_job(mode: str) -> bool:
 
     else:
         # Single video or playlist mode
+        content_type = None
         print(f"\nFetching video information...")
 
         try:
@@ -1892,10 +2089,12 @@ def run_new_job(mode: str) -> bool:
     # Download transcripts using multi-threaded mode with proxies
     videos_data, success_count, was_interrupted = download_transcripts_parallel(
         videos, source_name, source_type, num_threads,
-        output_config=output_config
+        output_config=output_config, content_type=content_type, source_url=url
     )
 
+    # Update manifest with results
     if videos_data:
+        update_manifest(url, source_name, source_type, content_type, videos_data)
         return finalize_output(videos_data, source_name, source_type, success_count, was_interrupted, output_config)
     return True  # Continue to menu if no data
 
@@ -1904,11 +2103,15 @@ def resume_job(progress: dict) -> bool:
     """Resume an interrupted job. Returns True to continue to menu, False to exit."""
     source_name = progress['source_name']
     source_type = progress['source_type']
+    content_type = progress.get('content_type')
+    source_url = progress.get('source_url')
     videos = progress['videos']
     existing_data = progress.get('videos_data', [])
     completed_ids = set(progress.get('completed_ids', [v['id'] for v in existing_data]))
 
     print(f"\nResuming job: {source_name}")
+    if content_type:
+        print(f"Content filter: {content_type}")
     print(f"Progress: {len(completed_ids)}/{len(videos)} videos completed")
 
     # Always use threading mode - ask for thread count
@@ -1922,12 +2125,173 @@ def resume_job(progress: dict) -> bool:
     videos_data, success_count, was_interrupted = download_transcripts_parallel(
         videos, source_name, source_type, num_threads,
         existing_data=existing_data, completed_ids=completed_ids,
-        output_config=output_config
+        output_config=output_config, content_type=content_type, source_url=source_url
     )
 
     if videos_data:
+        if source_url:
+            update_manifest(source_url, source_name, source_type, content_type, videos_data)
         return finalize_output(videos_data, source_name, source_type, success_count, was_interrupted, output_config)
     return True  # Continue to menu if no data
+
+
+def fetch_channel_videos(url: str, content_type: str, proxy_pool: ProxyPool) -> tuple[list[dict], str]:
+    """
+    Fetch videos from a channel URL based on content_type filter.
+    Returns (videos_list, source_name).
+    """
+    url = normalize_channel_url(url)
+    videos = []
+    source_name = ""
+
+    if content_type == "videos":
+        print(f"\nFetching videos from channel...")
+        videos, source_name, _ = get_video_ids_from_url(url + "/videos", "channel", proxy_pool)
+
+    elif content_type == "shorts":
+        print(f"\nFetching shorts from channel...")
+        videos, source_name, _ = get_video_ids_from_url(url + "/shorts", "channel", proxy_pool)
+
+    else:  # both
+        print(f"\nFetching videos from channel...")
+        try:
+            videos_list, source_name, _ = get_video_ids_from_url(url + "/videos", "channel", proxy_pool)
+            videos.extend(videos_list)
+            print(f"Found {len(videos_list)} video(s)")
+        except Exception as e:
+            print(f"Warning: Could not fetch videos: {e}")
+
+        print(f"\nFetching shorts from channel...")
+        try:
+            shorts_list, sn, _ = get_video_ids_from_url(url + "/shorts", "channel", proxy_pool)
+            videos.extend(shorts_list)
+            if not source_name:
+                source_name = sn
+            print(f"Found {len(shorts_list)} short(s)")
+        except Exception as e:
+            print(f"Warning: Could not fetch shorts: {e}")
+
+        if not source_name:
+            match = re.search(r'@([^/]+)', url)
+            source_name = match.group(1) if match else "channel"
+
+    return videos, source_name
+
+
+def resume_update_job() -> bool:
+    """
+    Smart resume: fetch current video list from a channel/playlist,
+    diff against manifest to find what's missing, download only those.
+    Returns True to continue to menu, False to exit.
+    """
+    print("\nResume/Update - download only missing transcripts\n")
+    print("  [1] Channel")
+    print("  [2] Playlist\n")
+
+    while True:
+        try:
+            choice = int(input("Enter your choice (1-2): "))
+            if choice in (1, 2):
+                break
+            print("Invalid choice.")
+        except ValueError:
+            print("Invalid input.")
+
+    mode = "channel" if choice == 1 else "playlist"
+
+    # Get URL
+    if mode == "channel":
+        url = input("Enter YouTube channel URL: ").strip()
+    else:
+        url = input("Enter YouTube playlist URL: ").strip()
+
+    if not url:
+        print("Error: No URL provided.")
+        return True
+
+    # Normalize channel URL
+    if mode == "channel":
+        url = normalize_channel_url(url)
+
+    # Check manifest for previous downloads
+    manifest_entry = get_manifest_entry(url, source_type=mode)
+    content_type = None
+
+    if manifest_entry:
+        prev_downloaded = len(manifest_entry.get('downloaded_ids', []))
+        prev_no_transcript = len(manifest_entry.get('no_transcript_ids', []))
+        prev_content_type = manifest_entry.get('content_type')
+        print(f"\nFound previous download history for: {manifest_entry.get('source_name', url)}")
+        print(f"  Previously downloaded: {prev_downloaded} transcripts")
+        print(f"  No transcript available: {prev_no_transcript}")
+        if prev_content_type:
+            print(f"  Content filter was: {prev_content_type}")
+        print(f"  Last updated: {manifest_entry.get('last_updated', 'unknown')}")
+
+    if mode == "channel":
+        if manifest_entry and manifest_entry.get('content_type'):
+            prev_ct = manifest_entry['content_type']
+            print(f"\nUse same content filter as before ({prev_ct})? [Y/n]: ", end="")
+            answer = input().strip().lower()
+            if answer in ('', 'y', 'yes'):
+                content_type = prev_ct
+            else:
+                content_type = get_channel_content_type()
+        else:
+            content_type = get_channel_content_type()
+
+    # Initialize proxy pool
+    proxy_pool = ProxyPool(PROXY_FILE, validate=False)
+
+    # Fetch current video list
+    print(f"\nFetching current video list from YouTube...")
+    try:
+        if mode == "channel":
+            all_videos, source_name = fetch_channel_videos(url, content_type, proxy_pool)
+        else:
+            all_videos, source_name, _ = get_video_ids_from_url(url, "playlist", proxy_pool)
+    except Exception as e:
+        print(f"Error fetching video list: {e}")
+        return True
+
+    if not all_videos:
+        print("No videos found.")
+        return True
+
+    print(f"\nTotal videos on YouTube: {len(all_videos)}")
+
+    # Diff against manifest
+    already_done_ids = set()
+    if manifest_entry:
+        already_done_ids.update(manifest_entry.get('downloaded_ids', []))
+        already_done_ids.update(manifest_entry.get('no_transcript_ids', []))
+
+    missing_videos = [v for v in all_videos if v['id'] not in already_done_ids]
+
+    print(f"Already processed: {len(already_done_ids)}")
+    print(f"Missing (to download): {len(missing_videos)}")
+
+    if not missing_videos:
+        print("\nAll videos are already downloaded! Nothing to do.")
+        return wait_for_spacebar()
+
+    # Ask for thread count and output config
+    num_threads = get_threading_choice()
+    output_config = get_output_config()
+
+    source_type = mode  # "channel" or "playlist"
+
+    # Download only missing videos
+    videos_data, success_count, was_interrupted = download_transcripts_parallel(
+        missing_videos, source_name, source_type, num_threads,
+        output_config=output_config, content_type=content_type, source_url=url
+    )
+
+    # Update manifest with new results
+    if videos_data:
+        update_manifest(url, source_name, source_type, content_type, videos_data)
+        return finalize_output(videos_data, source_name, source_type, success_count, was_interrupted, output_config)
+    return True
 
 
 def main():
@@ -1958,6 +2322,8 @@ def main():
         continue_to_menu = True
         if choice == 4:
             continue_to_menu = resume_job(progress)
+        elif choice == 5:
+            continue_to_menu = resume_update_job()
         else:
             mode_map = {1: "single", 2: "playlist", 3: "channel"}
             mode = mode_map[choice]
