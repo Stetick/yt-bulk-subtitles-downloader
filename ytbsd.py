@@ -35,7 +35,7 @@ try:
         TranscriptsDisabled,
         CouldNotRetrieveTranscript,
     )
-    from youtube_transcript_api.proxies import GenericProxyConfig
+    from youtube_transcript_api.proxies import GenericProxyConfig, WebshareProxyConfig
     from youtube_transcript_api.formatters import SRTFormatter
 except ImportError:
     print("Error: youtube-transcript-api is not installed. Install it with: pip install youtube-transcript-api")
@@ -84,8 +84,49 @@ PROGRESS_FILE = os.path.join(SCRIPT_DIR, ".progress.json")
 PROXY_FILE = os.path.join(SCRIPT_DIR, "proxies.txt")
 MANIFEST_FILE = os.path.join(SCRIPT_DIR, ".manifest.json")
 NO_TRANSCRIPT_LOG = os.path.join(SCRIPT_DIR, "no_transcript_log.txt")
+WEBSHARE_CONFIG_FILE = os.path.join(SCRIPT_DIR, "webshare.txt")
 _no_transcript_log_lock = threading.Lock()
 _no_transcript_logged_ids = set()
+
+
+def load_webshare_credentials():
+    """Load Webshare username/password from webshare.txt if present.
+    Format: two lines, username on line 1, password on line 2.
+    Returns (username, password) or (None, None) if not configured.
+    """
+    if not os.path.exists(WEBSHARE_CONFIG_FILE):
+        return None, None
+    try:
+        with open(WEBSHARE_CONFIG_FILE, 'r', encoding='utf-8') as f:
+            lines = [ln.strip() for ln in f if ln.strip() and not ln.startswith('#')]
+        if len(lines) >= 2:
+            return lines[0], lines[1]
+    except Exception:
+        pass
+    return None, None
+
+
+WEBSHARE_USERNAME, WEBSHARE_PASSWORD = load_webshare_credentials()
+USE_WEBSHARE = bool(WEBSHARE_USERNAME and WEBSHARE_PASSWORD)
+
+
+def build_ytt_api(proxy: str = None):
+    """Build a YouTubeTranscriptApi client.
+    Priority: Webshare (if configured) > explicit proxy string > direct.
+    """
+    if USE_WEBSHARE:
+        return YouTubeTranscriptApi(
+            proxy_config=WebshareProxyConfig(
+                proxy_username=WEBSHARE_USERNAME,
+                proxy_password=WEBSHARE_PASSWORD,
+            )
+        )
+    if proxy:
+        proxy_url = f"http://{proxy}"
+        return YouTubeTranscriptApi(
+            proxy_config=GenericProxyConfig(http_url=proxy_url, https_url=proxy_url)
+        )
+    return YouTubeTranscriptApi()
 
 
 # ============================================================================
@@ -793,12 +834,7 @@ def check_transcript_availability(video_id: str, proxy: str = None) -> tuple:
     Check what transcripts are available for a video.
     Returns (transcript_obj, language_info) or raises NoTranscriptError.
     """
-    if proxy:
-        proxy_url = f"http://{proxy}"
-        proxy_config = GenericProxyConfig(http_url=proxy_url, https_url=proxy_url)
-        ytt_api = YouTubeTranscriptApi(proxy_config=proxy_config)
-    else:
-        ytt_api = YouTubeTranscriptApi()
+    ytt_api = build_ytt_api(proxy=proxy)
 
     try:
         transcript_list = ytt_api.list(video_id)
@@ -1464,6 +1500,14 @@ def download_transcripts_parallel(videos: list[dict], source_name: str, source_t
     # Initialize proxy pool
     proxy_pool = ProxyPool(PROXY_FILE, validate=False)
 
+    # Webshare mode: library auto-rotates IPs, so proxies.txt is unused.
+    # Inject placeholder entries so the work queue still dispatches work.
+    # build_ytt_api() ignores the proxy string when USE_WEBSHARE is True.
+    if USE_WEBSHARE:
+        proxy_pool.proxies = [f"webshare-{i}:0" for i in range(num_threads * 2)]
+        print(f"\n*** Webshare rotating residential proxies ACTIVE ***")
+        print(f"    proxies.txt ignored; library auto-rotates IPs per request.")
+
     # NOTE: We no longer cap threads to remaining videos!
     # Multiple threads can now collaborate on the same video with different proxies
     print(f"\nDownloading transcripts for {total} video(s) [Collaborative Multi-Proxy Mode]")
@@ -1808,6 +1852,19 @@ def get_user_choice(has_unfinished: bool) -> int:
 def get_threading_choice() -> int:
     """Ask user for number of threads. Always uses threading."""
     # Check if proxy file exists
+    if USE_WEBSHARE:
+        print(f"\n*** Webshare rotating residential proxies detected ***")
+        print(f"    IPs auto-rotate per request. Recommended: 12 threads.")
+        while True:
+            try:
+                user_input = input("Number of threads (1-50, default 12): ")
+                threads = int(user_input) if user_input.strip() else 12
+                if 1 <= threads <= 50:
+                    return threads
+            except ValueError:
+                pass
+            print("Invalid input, try again.")
+
     if not os.path.exists(PROXY_FILE):
         print(f"\nWarning: {PROXY_FILE} not found!")
         print("Create this file with proxy list (IP:PORT per line)")
